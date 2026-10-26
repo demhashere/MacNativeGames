@@ -30,6 +30,10 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from shader_list import ShaderList   # noqa: E402
 
+# The files a prepared variant consists of. TOTK_SEED_SPIRV=1 (the Linux build, games/totk/linux): its SPIR-V too, which
+# the Vulkan backend loads (the Mac needs only the MSL and the reflection).
+VARIANT_FILES = ('_b.metal', '_b.json') + (('.spv',) if os.environ.get('TOTK_SEED_SPIRV') == '1' else ())
+
 CHAIN = 'totk-native-v7-unverified'
 MIN_SHADERS = 8000
 ZSTD = b'\x28\xb5\x2f\xfd'
@@ -272,7 +276,7 @@ class TranslationCache:
         failed = self.folder/(variant+'.failed')
         if failed.is_file():
             return dict(ok=False, error=json.loads(failed.read_text()).get('error'))
-        files = [variant+'_b.metal', variant+'_b.json']
+        files = [variant+end for end in VARIANT_FILES]
         try:
             cached = [os.stat(self.folder/name).st_ino for name in files]
         except FileNotFoundError:
@@ -291,7 +295,7 @@ class TranslationCache:
         if not reply.get('ok'):
             (self.folder/(variant+'.failed')).write_text(json.dumps(dict(error=reply.get('error'))))
             return
-        for name in (variant+'_b.metal', variant+'_b.json'):
+        for name in [variant+end for end in VARIANT_FILES]:
             (self.folder/name).unlink(missing_ok=True)
             try:
                 os.link(staging/name, self.folder/name)
@@ -307,7 +311,7 @@ class TranslationCache:
 
     def prune(self, variants):
         for p in ([] if self.shared else self.folder.iterdir()):
-            for end in ('_b.metal', '_b.json', '.failed'):
+            for end in VARIANT_FILES + ('.failed',):
                 if p.name.endswith(end) and p.name[:-len(end)] not in variants:
                     p.unlink()
                     self.digests.pop(p.name, None)
@@ -776,7 +780,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
                             raise ValueError('prepared shader identity mismatch')
                         deps = json.dumps(refl['deps'], sort_keys=True, separators=(',', ':'))
                         if deps in mine:   # same deps as a variant already made: keep one
-                            for name in (variant+'_b.metal', variant+'_b.json'):
+                            for name in [variant+end for end in VARIANT_FILES]:
                                 (staging/name).unlink(missing_ok=True)
                             with lock:
                                 aliases[variant] = mine[deps]
@@ -833,7 +837,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
     # behind before publishing reflection; those must not become cached shaders.
     wanted = set()
     for variant in completed:
-        wanted.update([variant+'_b.metal', variant+'_b.json', variant.split('-')[0]+'.variants'])
+        wanted.update([variant+end for end in VARIANT_FILES] + [variant.split('-')[0]+'.variants'])
     for p in staging.iterdir():
         if p.name not in wanted:
             p.unlink(missing_ok=True)
@@ -846,7 +850,7 @@ def prepare(romfs, output, translator, spirv_cross, version, shader_list=None, m
     # ships a name the runtime's strict filename check (totk_shader_seed.h) would reject.
     wanted_final = wanted | {'pso_manifest.tsv', 'shader-keys.json'}
     # Each completed variant's two files are links to the translation cache, whose digests it keeps; the rest are read.
-    linked = {variant+end for variant in completed for end in ('_b.metal', '_b.json')}
+    linked = {variant+end for variant in completed for end in VARIANT_FILES}
     report = dict(**identity, shaders=len(completed), discovered=len(shaders), located=len(extra), startup_shaders=ready,
                   all_default=GAMES[game]['all_default'],   # every shader has its default variant: the runtime contributes only other states
                   listed_variants=sum(1 for _, _, _, why in jobs if why == 'listed'), skipped=failed,

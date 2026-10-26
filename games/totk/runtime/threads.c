@@ -251,7 +251,7 @@ static void core_put(thr_t *t) {   // holding G
    rule: a strictly better priority, or at priority 59 (Horizon rotates that priority on cores 0-2 every 10 ms) a waiter
    once the owner has held the core 10 ms. TOTK_ASYNC_PREEMPT=0 leaves only the preemption at SVC entry. */
 #include <string.h>
-#include <sys/ucontext.h>
+#include "mng_ucontext.h"
 static int g_async_preempt = -1;
 static uint64_t g_preempt_kicks, g_preempt_async;   // signals sent / cores given up in the handler (state dump)
 static int core_beats(const thr_t *w, const thr_t *o, uint64_t now) {   // holding G: may waiter w take running o's core?
@@ -362,8 +362,8 @@ static void preempt_signal(int sig, siginfo_t *si, void *context) {
     (void)sig; (void)si;
     thr_t *t = me_or_null();
     if (!t || !__atomic_load_n(&t->preempt, __ATOMIC_ACQUIRE) || t->cur_core < 0) return;
-    uint64_t pc = (uint64_t)((ucontext_t *)context)->uc_mcontext->__ss.__pc;
-    uintptr_t tp; __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(tp));
+    uint64_t pc = (uint64_t)UC_PC(((ucontext_t *)context));
+    uintptr_t tp; RUNTIME_READ_TP(tp);
     if (!runtime_hle_tsd_off || !*(volatile uintptr_t *)(tp + runtime_hle_tsd_off) || !runtime_guest_code_pc(pc)) return;
     int saved = errno;
     pthread_mutex_lock(&G);

@@ -5,7 +5,9 @@
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
 #include <stdio.h>
+#ifdef __APPLE__
 #include <CoreFoundation/CoreFoundation.h>
+#endif
 #include <stdlib.h>
 #include <stdatomic.h>
 #include <ctype.h>
@@ -74,10 +76,16 @@ static uint64_t app_pool(void){static uint64_t v;if(!v){const char *e=getenv("TO
 #else
 #define ASLR_SIZE (GUEST_ADDRESS_LIMIT-(uintptr_t)low_space)
 #endif
+#ifdef __linux__
+#include "../linux/guest_mem.h"   /* memfd-backed regions: the GPU reads guest memory through the same pages */
+static uint8_t *reserve_fixed(uint64_t at,uint64_t size){ return guest_mem_reserve_fixed((uintptr_t)at,size,at>=ALIAS_SPACE_AT?"alias":"low"); }
+#define mach_vm_deallocate(task,addr,size) (guest_mem_release((void *)(uintptr_t)(addr),(size)),KERN_SUCCESS)
+#else
 static uint8_t *reserve_fixed(uint64_t at,uint64_t size){
  mach_vm_address_t a=at;   /* FIXED without OVERWRITE: fails instead of replacing an existing mapping */
  return mach_vm_map(mach_task_self(),&a,size,0,VM_FLAGS_FIXED,MEMORY_OBJECT_NULL,0,FALSE,VM_PROT_NONE,VM_PROT_ALL,VM_INHERIT_DEFAULT)==KERN_SUCCESS?(uint8_t *)(uintptr_t)a:NULL;
 }
+#endif
 #define GUEST_ALIGN (2ULL<<20)
 /* Reserve size bytes in a free gap (2 MiB aligned). The end of the map is
    not reported, so the last gap is only tried; FIXED fails there with KERN_NO_SPACE when it reaches past the end. */
@@ -205,7 +213,11 @@ static uint64_t alias_map(int unmap,uint64_t addr,uint64_t size){
   uint64_t released=0;for(unsigned i=0;i<count;i++)if(alias_pages[first+i]){alias_pages[first+i]=0;alias_stale[first+i]=1;released+=4096;}alias_bytes-=released;
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
   for(uint64_t page=low;page<high;page+=0x4000){unsigned p=(unsigned)((page-start)/4096);if(!alias_pages[p]&&!alias_pages[p+1]&&!alias_pages[p+2]&&!alias_pages[p+3]){
+#ifdef __linux__
+   if(guest_mem_decommit((void *)page,0x4000))runtime_fail("decommit physical alias page");
+#else
    if(mmap((void *)page,0x4000,PROT_NONE,MAP_FIXED|MAP_PRIVATE|MAP_ANON,-1,0)!=(void *)page)runtime_fail("decommit physical alias page");
+#endif
    memset(alias_stale+p,0,4);}}
  }else if(fresh){
   uint64_t low=addr&~0x3fffULL,high=(addr+size+0x3fff)&~0x3fffULL;
@@ -291,11 +303,17 @@ static uint64_t desired_language(void) {
     if(k==2&&isalpha((unsigned char)p[0])&&isalpha((unsigned char)p[1])){region[0]=(char)toupper((unsigned char)p[0]);region[1]=(char)toupper((unsigned char)p[1]);}
     p+=k;}
   } else {
+#ifdef __APPLE__
    CFLocaleRef locale=CFLocaleCopyCurrent();
    CFStringRef value=CFLocaleGetValue(locale,kCFLocaleLanguageCode);
    if(value)CFStringGetCString(value,language,sizeof(language),kCFStringEncodingUTF8);
    value=CFLocaleGetValue(locale,kCFLocaleCountryCode);
    if(value)CFStringGetCString(value,region,sizeof(region),kCFStringEncodingUTF8);CFRelease(locale);
+#else   /* Linux: the desktop locale, e.g. LANG=pt_BR.UTF-8 */
+   const char *l=getenv("LC_ALL");if(!l||!*l)l=getenv("LC_MESSAGES");if(!l||!*l)l=getenv("LANG");
+   if(l&&*l&&strcmp(l,"C")&&strcmp(l,"POSIX")){size_t n=strcspn(l,"_.@-");if(n<sizeof(language))memcpy(language,l,n);
+    if(l[n]=='_'&&isalpha((unsigned char)l[n+1])&&isalpha((unsigned char)l[n+2])){region[0]=(char)toupper((unsigned char)l[n+1]);region[1]=(char)toupper((unsigned char)l[n+2]);}}
+#endif
   }
 #if defined(TOTK_GAME_V143) || defined(GAME_BOTW190)
   const char *portuguese=!strcmp(region,"BR")?"pt-BR":"pt";

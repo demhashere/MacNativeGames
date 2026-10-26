@@ -13,6 +13,22 @@ typedef struct {
  uint8_t *base; unsigned relative, symbolic, cross, weak;
 } Module;
 extern pthread_key_t runtime_keys[8];
+/* The guest's per-thread slots (K18, KTLS, KTLR, KGATE, the host-stack slot, ...) at the thread pointer plus an offset.
+   Darwin: TPIDRRO_EL0 + pthread key * 8 (the TSD). Linux: TPIDR_EL0 (glibc's thread pointer) + the offset of an
+   initial-exec TLS slot of this executable (linux/platform.c); the loader rewrites the module code's thread pointer reads. */
+#ifdef __APPLE__
+#define RUNTIME_READ_TP(v) __asm__ volatile("mrs %0, tpidrro_el0" : "=r"(v))
+#define RUNTIME_SLOT_GET(i) pthread_getspecific(runtime_keys[i])
+#define RUNTIME_SLOT_SET(i, v) pthread_setspecific(runtime_keys[i], (v))
+#define RUNTIME_SLOT_OFFSET(i) ((uint64_t)runtime_keys[i] * 8)
+#else
+#define RUNTIME_READ_TP(v) __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v))
+extern __thread uint64_t mng_slots[8] __attribute__((tls_model("initial-exec")));
+uint64_t mng_slot_offset(unsigned i);
+#define RUNTIME_SLOT_GET(i) ((void *)(uintptr_t)mng_slots[i])
+#define RUNTIME_SLOT_SET(i, v) (mng_slots[i] = (uint64_t)(uintptr_t)(v), 0)
+#define RUNTIME_SLOT_OFFSET(i) mng_slot_offset(i)
+#endif
 _Noreturn void runtime_fail(const char *message);
 void *runtime_symbol(const char *name);
 void *runtime_override(const char *name);

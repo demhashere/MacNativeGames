@@ -1,5 +1,12 @@
 // NVN implementation registration macros shared by hle_nvn.c and TOTK extension files.
 #pragma once
+#ifndef MNG_DATA_SECTION
+#ifdef __APPLE__
+#define MNG_DATA_SECTION(name) "__DATA," #name
+#else
+#define MNG_DATA_SECTION(name) #name   /* ELF: found through the linker's __start_ / __stop_ symbols */
+#endif
+#endif
 #include "nvn_protos.h"
 
 // TOTK: NVN entry points that wait for the GPU, the display or other threads give up the caller's virtual core for
@@ -12,13 +19,13 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 #define NVN(name, ret, ...)                                                                       \
     static ret h_##name(__VA_ARGS__);                                                             \
     static const NVNT_##name chk_##name __attribute__((unused)) = h_##name;                       \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, section(MNG_DATA_SECTION(swnvn)))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 // 无原型的新版接口：不做签名检查
 // Newer interfaces without prototypes: no signature check
 #define NVN_NOPROTO(name, ret, ...)                                                               \
     static ret h_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section("__DATA,swnvn"))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
+    __attribute__((used, section(MNG_DATA_SECTION(swnvn)))) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
 
@@ -26,5 +33,5 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 // name table (no counting thunk). They are returned directly by nvn_lookup.
 #define NVN_EXTRA(name, ret, ...)                                                                 \
     static ret x_##name(__VA_ARGS__);                                                             \
-    __attribute__((used, section("__DATA,totknvnx"))) static const nvn_impl ex_##name = {#name, (void *)x_##name}; \
+    __attribute__((used, section(MNG_DATA_SECTION(totknvnx)))) static const nvn_impl ex_##name = {#name, (void *)x_##name}; \
     static ret x_##name(__VA_ARGS__)

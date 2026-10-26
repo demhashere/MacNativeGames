@@ -10,6 +10,7 @@
 #include <math.h>
 #include "game_patches.h"
 #include "game_version.h"
+#include "jq_wait.h"
 #ifdef GAME_BOTW190
 #include "aspect_math.h"   /* key 4: TOTK_ASPECT parsing */
 #endif
@@ -55,6 +56,7 @@ static uint64_t last_present_ns, report_ns, report_frames;
 static double frame_samples[5], report_seconds, report_game, report_short_ms, report_long_ms;
 static unsigned frame_sample_count, frame_sample_next, report_short, report_long;
 static _Atomic uint32_t pinned_step_us;
+static _Atomic uint32_t held_step_us;   /* the frame hold's step (runtime_frame_step_hold), 0: the measured average */
 #ifdef GAME_BOTW160
 enum { VFR_INSTANCE = 0x2d1e170, VFR_RATIO = 0x3c, VFR_DELTA_TIME = 0x138 };
 #else   /* 1.9.0: the singleton pointer is main+0x1e93890, the object's layout is the same */
@@ -83,9 +85,14 @@ void runtime_frame_step_pin(double ms) {
     else fprintf(stderr, "[botw] frame step pinned at %.3f ms (ratio %.3f, diagnostics)%s\n", us / 1000.0, us / 1e6 * 30.0,
                  frame_step_data ? "" : " -- but the real-time patch is off, nothing changes");
 }
+/* The frame hold (hle_nvn.c fhold_tick, Linux) keeps each frame on screen for whole vsyncs: after a frame on time it sets
+   the next frame's step to exactly its hold before this present's measurement, so motion is even; 0 (a late frame, the
+   hold off) leaves the measured average below. */
+void runtime_frame_step_hold(double seconds) { atomic_store(&held_step_us, seconds > 0 && seconds < 0.1 ? (uint32_t)(seconds * 1e6 + 0.5) : 0); }
 /* Every 30 s one line: frames and their real time, the game time the steps added up to, what the game actually reads (the
    VFR's ratio and core 0's delta time), and the intervals outside 1/120..1/15 s with what clamping each of them on its own
    would have added or dropped. */
+static void jq_wait_report(void);   /* job-queue waits, with the frame-step line (patch_jq_wait) */
 static void frame_step_report(uint64_t now_ns) {
     if (!report_ns) { report_ns = now_ns; return; }
     if (now_ns - report_ns < 30000000000ull) return;
@@ -106,6 +113,7 @@ static void frame_step_report(uint64_t now_ns) {
                     "%.3f, delta time %.2f ms; %u intervals under 1/120 s (clamping each: +%.0f ms), %u over 1/15 s (-%.0f ms)%s\n",
             (unsigned long long)report_frames, span, report_frames / span, report_frames ? report_seconds / report_frames * 1e3 : 0, game,
             ratio, delta * 1e3, report_short, report_short_ms, report_long, report_long_ms, ticks);
+    jq_wait_report();
     report_ns = now_ns; report_frames = report_ticks = 0; report_seconds = report_game = report_short_ms = report_long_ms = 0; report_short = report_long = 0;
 }
 static void frame_step_measure(uint64_t now_ns) {
@@ -130,6 +138,8 @@ static void frame_step_measure(uint64_t now_ns) {
     for (unsigned i = 0; i < frame_sample_count; i++) sum += frame_samples[i];
     double step = sum / frame_sample_count;
     if (step > 1.0 / 15.0) step = 1.0 / 15.0;
+    uint32_t held = atomic_load_explicit(&held_step_us, memory_order_relaxed);
+    if (held) step = held / 1e6;
     report_game += step;
     atomic_store_explicit(frame_step_data, frame_step_bits((float)step), memory_order_release);
 }
@@ -416,7 +426,7 @@ static void patch_realtime(Module *m) {
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ucontext.h>
+#include "mng_ucontext.h"
 uint32_t runtime_thread_current_handle(void);
 enum { JQ_TAKE, JQ_DONE, SYNC_PRE, SYNC_POST, SYNC_END, WAKE_SKIP, JQ_SITES };
 static const struct { uint32_t off, word; const char *what; } g_jq_site[JQ_SITES] = {
@@ -487,6 +497,145 @@ static void patch_render_1080(Module *m) {
     memcpy(m->base + RENDER_MOVK, &movk, 4);
     fprintf(stderr, "[botw] docked render size 1920x1080 (shipped: 1600x900; TOTK_RENDER_RES=900 keeps it)\n");
 }
+#if defined(GAME_BOTW190) && defined(TOTK_LINUX)
+/* Job-queue wait (TOTK_JQ_WAIT=0: as shipped; runtime/jq_wait.h, after nxnative's spin gate). The job queue's take
+   (main+0xef62dc, x21 = the queue: lock +0x1c, cursor +0x94, flag +0x98) keeps the first item of some jobs for the main
+   thread's core; a worker that finds it untaken releases the lock and takes it again (main+0xef63e8 cbz w14,
+   main+0xef6354) until the main thread has taken it. nxnative measured this in Zora's Domain (M2 Max): the two workers
+   kept the lock between their cores and the main thread lost the race for it for 30-210 ms at a time, frames with over
+   30 ms of CPU work every 1-10 s. That back-edge now goes to a cave in the zero tail of the last patch page (data page
+   - 0x100, below key 4's) that watches the flag and cursor without the lock, sleeps after 2 ms of watching, and counts
+   each wait on the data page (+0x200); jq_wait_report prints them with the frame-step line every 30 s. Linux only: the
+   sleep is a Linux system call. */
+enum { JQ_SITE = 0xef63e8, JQ_RETRY = 0xef6354, JQ_OK = 0xef63ec, JQ_CAVE_BELOW = 0x100, JQ_PAGE = 0x200 };
+static uint8_t *g_jqw;   /* the wait statistics on the data page; NULL when not patched */
+static uint64_t g_jqw_hz;
+static void patch_jq_wait(Module *m) {
+    const char *e = getenv("TOTK_JQ_WAIT");
+    if (e && !strcmp(e, "0")) { fprintf(stderr, "[botw] job-queue wait as shipped (TOTK_JQ_WAIT=0)\n"); return; }
+    static const struct { uint32_t off, word; } check[] = {
+        {0xef6384u, 0x394262aeu},   /* ldrb w14, [x21, #0x98]   the flag */
+        {0xef6388u, 0x7100001fu},   /* cmp w0, #0               the core */
+        {0xef6390u, 0xb94096b9u},   /* ldr w25, [x21, #0x94]    the cursor */
+        {JQ_RETRY, 0xb40004f4u},    /* cbz x20, main+0xef63f0   the lock again */
+        {JQ_SITE, 0x34fffb6eu},     /* cbz w14, main+0xef6354 */
+        {JQ_OK, 0x1400000bu},       /* b main+0xef6418 */
+    };
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].word) { fprintf(stderr, "[botw] job-queue wait main+%#x: found %08x expected %08x: as shipped\n", check[i].off, w, check[i].word); return; }
+    }
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL, c = data_off - JQ_CAVE_BELOW;
+    if (data_off + 0x4000 != m->size || c < m->file_size || c + 4 * JQW_WORDS > data_off - 0x40) { fprintf(stderr, "[botw] job-queue wait: no room for the cave: as shipped\n"); return; }
+    for (unsigned i = 0; i < 4 * JQW_WORDS; i++) if (m->base[c + i]) { fprintf(stderr, "[botw] job-queue wait: the cave's place is not empty: as shipped\n"); return; }
+    uint8_t *page = m->base + data_off + JQ_PAGE;
+    uint64_t base = (uintptr_t)m->base, cave = base + c;
+    if (!jqw_range_ok(cave, (uintptr_t)page, base + JQ_RETRY, base + JQ_OK)) { fprintf(stderr, "[botw] job-queue wait: cave out of branch range: as shipped\n"); return; }
+    uint64_t hz; __asm__ volatile("mrs %0, cntfrq_el0" : "=r"(hz));
+    uint64_t poll = hz / 500;   /* 2 ms of watching before the first sleep */
+    struct timespec ts = {0, 50000};
+    memcpy(page + JQW_POLL, &poll, 8); memcpy(page + JQW_SLEEP, &ts, sizeof ts);
+    uint32_t w[JQW_WORDS]; jqw_build(w, cave, (uintptr_t)page, base + JQ_RETRY, base + JQ_OK);
+    memcpy(m->base + c, w, sizeof w);
+    uint32_t b = jqw_b(base + JQ_SITE, cave); memcpy(m->base + JQ_SITE, &b, 4);
+    g_jqw = page; g_jqw_hz = hz;
+    fprintf(stderr, "[botw] job-queue wait: a worker waiting for the main thread's item watches the queue without taking its lock, "
+                    "sleeping after 2 ms (cave main+%#llx, %d instructions; TOTK_JQ_WAIT=0: as shipped)\n", (unsigned long long)c, JQW_WORDS);
+}
+static void jq_wait_report(void) {
+    if (!g_jqw) return;
+    uint64_t total = __atomic_exchange_n((uint64_t *)(void *)(g_jqw + JQW_TOTAL), 0, __ATOMIC_RELAXED),
+             longest = __atomic_exchange_n((uint64_t *)(void *)(g_jqw + JQW_LONGEST), 0, __ATOMIC_RELAXED),
+             waits = __atomic_exchange_n((uint64_t *)(void *)(g_jqw + JQW_WAITS), 0, __ATOMIC_RELAXED);
+    fprintf(stderr, "[botw] job-queue waits for the main thread's item: %llu, %.1f ms in all, longest %.2f ms\n",
+            (unsigned long long)waits, total * 1e3 / g_jqw_hz, longest * 1e3 / g_jqw_hz);
+}
+#else
+static void patch_jq_wait(Module *m) { (void)m; }
+static void jq_wait_report(void) {}
+#endif
+#ifdef GAME_BOTW190
+/* Render scale (TOTK_RENDER_SCALE=0.5..1; Fn+F6 cycles it while playing; after nxnative's DM_RENDER_SCALE). The
+   dynamic-resolution method (main+0x12666e4) keeps its scale in s8 (0.8-1.0 in 0.05 steps, or the game's forced 0.75 /
+   0.5) and applies it from main+0x1266880: each view's scale (+0x28a0 / +0x28a4 = s8 x the base width +0x1214 / the
+   output width +0x1210), from which the scene buffers are sized every frame (main+0x106340c), the shaders' resolution
+   ratio uking_dynamic_resolution_ratio and the other readers (an LOD check among them). The block runs only when the
+   dynamic path has just recomputed the scale or in a forced mode; main+0x126686c skips it otherwise. A cave at the block's
+   first instruction puts the host's scale (data page +0x180, 0 = none: the game's own) into s8, and one at the skip takes
+   the block every frame while a scale is set, so every scene pass follows it and the game's dynamic resolution is off:
+   1 holds full resolution at all times. The shadow maps, the HUD and the 1920x1080 output keep their size. x8, s0, s1
+   and the flags are dead at both sites. The caves sit in the zero tail of the last patch page (data page - 0x200). */
+enum { RS_APPLY = 0x1266880, RS_SKIP = 0x126686c, RS_SKIP_TO = 0x1266950, RS_PAGE = 0x180, RS_CAVE_BELOW = 0x200, RS_WORDS = 12 };
+static _Atomic uint32_t *g_rs;   /* the scale on the data page (float bits, 0 = the game's own); NULL when not patched */
+static uint32_t rs_bits(float f) { uint32_t b; memcpy(&b, &f, 4); return b; }
+static void rs_log(float s) {
+    if (s <= 0) fprintf(stderr, "[botw] render scale: the game's own (dynamic resolution as shipped)\n");
+    else fprintf(stderr, "[botw] render scale %.2f: the scene at %.0fx%.0f, dynamic resolution off (the output stays 1920x1080)\n", s, 1920 * s, 1080 * s);
+}
+static void patch_render_scale(Module *m) {
+    static const struct { uint32_t off, word; } check[] = {
+        {0x1266868u, 0x372000c8u},   /* tbnz w8, #4, main+0x1266880 */
+        {RS_SKIP, 0x14000039u},      /* b main+0x1266950 */
+        {RS_APPLY, 0xf940ae88u},     /* ldr x8, [x20, #0x158] */
+        {0x1266884u, 0xbd521680u},   /* ldr s0, [x20, #0x1214]   the base width */
+        {0x1266888u, 0x1e200909u},   /* fmul s9, s8, s0 */
+    };
+    for (size_t i = 0; i < sizeof check / sizeof *check; i++) {
+        uint32_t w; memcpy(&w, m->base + check[i].off, 4);
+        if (w != check[i].word) { fprintf(stderr, "[botw] render scale main+%#x: found %08x expected %08x: not available\n", check[i].off, w, check[i].word); return; }
+    }
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL, c = data_off - RS_CAVE_BELOW;
+    if (data_off + 0x4000 != m->size || c < m->file_size) { fprintf(stderr, "[botw] render scale: no room for the caves: not available\n"); return; }
+    for (unsigned i = 0; i < 4 * RS_WORDS; i++) if (m->base[c + i]) { fprintf(stderr, "[botw] render scale: the caves' place is not empty: not available\n"); return; }
+    const uint64_t base = (uintptr_t)m->base, A = base + c, B = A + 28, page = base + data_off;
+#define B_(pc, t) (0x14000000u | ((uint32_t)((int64_t)((t) - (pc)) >> 2) & 0x3ffffffu))
+#define BCOND(pc, t, cc) (0x54000000u | (((uint32_t)((int64_t)((t) - (pc)) >> 2) & 0x7ffffu) << 5) | (cc))
+#define CBZW(pc, t, rt) (0x34000000u | (((uint32_t)((int64_t)((t) - (pc)) >> 2) & 0x7ffffu) << 5) | (rt))
+    const uint32_t w[RS_WORDS] = {
+        adrp_reg(8, A, page),          /* A: adrp x8, <data page> */
+        0xbd418100u,                   /* ldr s0, [x8, #0x180]   the host's scale */
+        0x1e202008u,                   /* fcmp s0, #0.0 */
+        BCOND(A + 12, A + 20, 0xd),    /* b.le orig              none: the game's own */
+        0x1e204008u,                   /* fmov s8, s0 */
+        0xf940ae88u,                   /* orig: ldr x8, [x20, #0x158] */
+        B_(A + 24, base + RS_APPLY + 4),
+        adrp_reg(8, B, page),          /* B: adrp x8, <data page> */
+        0xb9418108u,                   /* ldr w8, [x8, #0x180] */
+        CBZW(B + 8, B + 16, 8),        /* cbz w8, skip */
+        B_(B + 12, base + RS_APPLY),   /* b <the apply block> */
+        B_(B + 16, base + RS_SKIP_TO), /* skip: b main+0x1266950, as shipped */
+    };
+    memcpy(m->base + c, w, sizeof w);
+    uint32_t ja = B_(base + RS_APPLY, A), jb = B_(base + RS_SKIP, B);
+#undef B_
+#undef BCOND
+#undef CBZW
+    memcpy(m->base + RS_APPLY, &ja, 4); memcpy(m->base + RS_SKIP, &jb, 4);
+    g_rs = (_Atomic uint32_t *)(void *)(m->base + data_off + RS_PAGE);
+    const char *e = getenv("TOTK_RENDER_SCALE"); float s = 0;
+    if (e && *e && strcmp(e, "off")) {
+        s = strtof(e, NULL);
+        if (!(s >= 0.5f && s <= 1.0f)) runtime_fail("TOTK_RENDER_SCALE must be between 0.5 and 1 (or off)");
+    }
+    atomic_store(g_rs, s > 0 ? rs_bits(s) : 0);
+    fprintf(stderr, "[botw] render scale: TOTK_RENDER_SCALE=0.5..1 or Fn+F6 fixes the scene's resolution (caves main+%#llx); ", (unsigned long long)c);
+    rs_log(s);
+}
+/* Fn+F6 (frontend): the game's own -> 1 -> 0.85 -> 0.75 -> 0.67 -> 0.5 -> the game's own; 0 when not patched */
+int runtime_render_scale_cycle(void) {
+    if (!g_rs) { fprintf(stderr, "[botw] render scale: not available in this build of the game\n"); return 0; }
+    static const float steps[] = {0, 1.0f, 0.85f, 0.75f, 0.67f, 0.5f};
+    uint32_t now = atomic_load(g_rs); size_t k = 0;
+    for (size_t i = 0; i < sizeof steps / sizeof *steps; i++) if ((steps[i] > 0 ? rs_bits(steps[i]) : 0) == now) k = i;
+    float next = steps[(k + 1) % (sizeof steps / sizeof *steps)];
+    atomic_store(g_rs, next > 0 ? rs_bits(next) : 0);
+    rs_log(next);
+    return 1;
+}
+#else
+static void patch_render_scale(Module *m) { (void)m; }
+int runtime_render_scale_cycle(void) { return 0; }
+#endif
 void runtime_game_patches(Module *m) {
     fprintf(stderr, "[botw] %s game-code patches\n", TOTK_GAME_VERSION);
     runtime_survey_init(m);   /* TOTK_SURVEY=1: survey pos / move (world_survey.c) */
@@ -496,6 +645,24 @@ void runtime_game_patches(Module *m) {
 #endif
     if (realtime_enabled()) patch_realtime(m);
     else fprintf(stderr, "[botw] real-time frame step off (TOTK_REALTIME=0): the game advances by its present interval\n");
+    patch_jq_wait(m);
+    patch_render_scale(m);
+#ifdef TOTK_LINUX
+    {   /* TOTK_CAVE_DUMP=<file> (with the loader's export-ios mode, which stops after the patches): the caves in the patch
+           page's zero tail and the branches into them, for a disassembler (llvm-objdump --adjust-vma=<the address printed>) */
+        const char *d = getenv("TOTK_CAVE_DUMP");
+        if (d && *d) {
+            uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL, c = data_off - 0x400;
+            FILE *f = fopen(d, "wb");
+            if (f) { fwrite(m->base + c, 1, 0x400, f); fclose(f); }
+            fprintf(stderr, "[botw] caves: main+%#llx (address %#llx) written to %s; data page at %#llx\n", (unsigned long long)c,
+                    (unsigned long long)((uintptr_t)m->base + c), d, (unsigned long long)((uintptr_t)m->base + data_off));
+            static const uint32_t sites[] = {0xef63e8u, 0x1266880u, 0x126686cu};
+            for (size_t i = 0; i < sizeof sites / sizeof *sites; i++) { uint32_t w; memcpy(&w, m->base + sites[i], 4);
+                fprintf(stderr, "[botw] caves: site main+%#x (address %#llx) %08x\n", sites[i], (unsigned long long)((uintptr_t)m->base + sites[i]), w); }
+        }
+    }
+#endif
     { const char *a = getenv("TOTK_EXCL_ACQUIRE");
       if (!a || strcmp(a, "0")) {
           unsigned t = excl_acquire(m->base, m->text_end), p = excl_acquire(m->base + m->patch_off, m->file_size - m->patch_off);
@@ -521,7 +688,7 @@ static double jq_ms(uint64_t since) { static mach_timebase_info_data_t tb; if (!
    replaced, and one line per update while a stick or d-pad direction (bits 16..23) is or was held: time, thread, the
    controller, the tick the loop will read, new and previous hold, the previous update's repeat bits, counts 16..23. */
 static int botw_pad_hook(ucontext_t *u) {
-    uint64_t *x = u->uc_mcontext->__ss.__x, c = x[19]; uint32_t hold = (uint32_t)x[11];
+    uint64_t *x = UC_X(u), c = x[19]; uint32_t hold = (uint32_t)x[11];
     x[8] = *(const uint32_t *)(uintptr_t)(c + 0x100);
     uint32_t old = *(const uint32_t *)(uintptr_t)(c + 0x114), rep = *(const uint32_t *)(uintptr_t)(c + 0x10);
     if ((hold | old) & 0xff0000u) {
@@ -535,15 +702,15 @@ static int botw_pad_hook(ucontext_t *u) {
                 n[16], n[17], n[18], n[19], n[20], n[21], n[22], n[23], dl[16], pu[16], dl[17], pu[17], dl[18], pu[18], dl[19], pu[19],
                 dl[20], pu[20], dl[21], pu[21], dl[22], pu[22], dl[23], pu[23]);
     }
-    u->uc_mcontext->__ss.__pc += 4; return 1;
+    UC_PC(u) += 4; return 1;
 }
 #endif
 int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was one of ours, handled */
 #ifdef GAME_BOTW160
-    if (g_pad_log_on && ((ucontext_t *)context)->uc_mcontext->__ss.__pc == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
+    if (g_pad_log_on && UC_PC(((ucontext_t *)context)) == (uintptr_t)g_pad_main + PAD_LOOP) return botw_pad_hook(context);
 #endif
     if (!g_jq_on) return 0;
-    ucontext_t *u = context; uint64_t pc = u->uc_mcontext->__ss.__pc, *x = u->uc_mcontext->__ss.__x;
+    ucontext_t *u = context; uint64_t pc = UC_PC(u), *x = UC_X(u);
     int site = -1; for (int i = 0; i < JQ_SITES; i++) if (pc == (uintptr_t)g_jq_main + g_jq_site[i].off) site = i;
     if (site < 0) return 0;
     uint64_t th = 0; pthread_threadid_np(NULL, &th); uint32_t h = runtime_thread_current_handle();
@@ -607,7 +774,7 @@ int botw_jq_hook(void *context) {   /* SIGTRAP from loader.c crash(): 1 = it was
         }
         break; }
     }
-    u->uc_mcontext->__ss.__pc = next_pc; return 1;
+    UC_PC(u) = next_pc; return 1;
 }
 #undef U32
 #undef U64
@@ -652,8 +819,8 @@ int runtime_output_mode_cycle(void) {
     return 1;
 }
 #ifdef GAME_BOTW190
-/* Key 4 (runtime/input.c): ultrawide on / off (TOTK_ASPECT, default 21:9; also 32:9, 3440x1440 or 2.39; TOTK_ASPECT set
-   also starts with it on). The game keeps drawing into its 16:9 canvas with the main camera's aspect ratio set to the wider
+/* Key 4 (runtime/input.c): 16:9 -> fit to the window -> wide -> 16:9 (wide: TOTK_ASPECT, default 21:9; also 32:9, 3440x1440
+   or 2.39; TOTK_ASPECT set starts on wide, TOTK_ASPECT=display on fitting the window, whose shape the view then follows). The game keeps drawing into its 16:9 canvas with the main camera's aspect ratio set to the wider
    one, so the picture holds the wider view squeezed horizontally; the present stretches it over the window
    (nvn_mtl.m present_stretch) and the UI drawn after the scene is squeezed back to the middle 16:9 (uw_ui_squeeze).
    The main camera's projection is a sead::PerspectiveProjection (vtable main+0x1d05380; aspect +0xb0, dirty +8) at +0x38
@@ -662,21 +829,63 @@ int runtime_output_mode_cycle(void) {
    fields (the near plane changes per frame), so the ratio is written into the field and the projection marked dirty: at
    the next present after the key, and at every present while it is on (a new setup would write 16:9 again). Off puts
    16:9 back. Only a 16:9 value is replaced (the constructor's 4:3 before the setup is left alone); a main camera of
-   another class stops the game. 1.9.0 Mac only. */
+   another class stops the game. 1.9.0 (Mac; Linux: vk_present.c present_stretch, vk_exec.c uw_ui_squeeze).
+   The game also sets the main camera back to 16:9 in play, at times every frame for a second or more (several camera
+   setups go through sead::PerspectiveProjection::set, main+0xeb49a4), and a frame whose matrix was rebuilt before the
+   next present drew a 16:9 view stretched over the window: a flash every 15 to 30 s. So the matrix update itself
+   (doUpdateMatrix, main+0xeb4a44, a leaf using x0, x1 and x8) takes the ratio: its load of tan(fovy / 2) and the aspect
+     main+0xeb4a50  ldp s1, s2, [x0, #172]  -> b <cave>
+   goes to a cave in the zero tail of the last patch page (main+data page - 0x40) that does the same load and, when x0 is
+   the main camera's projection (data page +0x100, 0 while 16:9) and its aspect is 16:9, takes the ratio from the data
+   page +0x108 instead; x16 / x17 are scratch. The field is still written at the present, for the code that reads it. */
 static uint8_t *g_uw_main;
-static float g_uw_wide;
-static _Atomic(uint32_t) g_uw_on;
-static int g_uw_written;   /* the field holds the wide ratio this code wrote (present thread only) */
-static float aspect_requested(void) {   /* TOTK's parser (aspect_math.h); "display" is not taken here */
-    double a = aspect_parse(getenv("TOTK_ASPECT"));
-    if (a < 0) runtime_fail("TOTK_ASPECT must be <w>:<h>, <w>x<h> or a ratio between 0.5 and 8");
-    return (float)a;
+static double g_uw_wide;
+static _Atomic int g_uw_step;          /* key 4's step (aspect_math.h): 16:9 -> fit to the window -> wide -> 16:9 */
+static _Atomic uint32_t g_uw_view;     /* the window's shape (float bits), runtime_aspect_view */
+static float g_uw_put;                 /* the ratio this code wrote into the field, 0 none (present thread only) */
+static uint8_t *g_uw_page;             /* the data page: +0x100 the projection the cave matches, +0x108 its ratio */
+enum { UW_MTX = 0xeb4a50, UW_PAGE_PROJ = 0x100, UW_PAGE_WANT = 0x108 };
+static float bits_f(uint32_t b) { float v; memcpy(&v, &b, 4); return v; }
+/* the cave (see above); 0 when the page layout or the shipped instruction is not as expected (the field alone then) */
+static int uw_cave(Module *m) {
+    uint64_t data_off = (m->file_size + 0x3fff) & ~0x3fffULL, c = data_off - 0x40, d = data_off + UW_PAGE_PROJ;
+    uint32_t orig; memcpy(&orig, m->base + UW_MTX, 4);
+    if (data_off + 0x4000 != m->size || c < m->file_size || orig != 0x2d558801u) return 0;
+    for (int i = 0; i < 0x40; i++) if (m->base[c + i]) return 0;
+#define LIT(op, rt, pc, t) ((op) | ((((uint32_t)(((int64_t)(t) - (int64_t)(pc)) >> 2)) & 0x7ffffu) << 5) | (rt))
+#define BNE(pc, t) (0x54000001u | ((((uint32_t)(((int64_t)(t) - (int64_t)(pc)) >> 2)) & 0x7ffffu) << 5))
+#define B(pc, t) (0x14000000u | (((uint32_t)(((int64_t)(t) - (int64_t)(pc)) >> 2)) & 0x3ffffffu))
+    const uint32_t w[11] = {
+        orig,                                  /* ldp s1, s2, [x0, #172] */
+        LIT(0x58000000u, 17, c + 4, d),        /* ldr x17, <page +0x100> */
+        0xeb11001fu,                           /* cmp x0, x17 */
+        BNE(c + 12, c + 0x28),
+        0xb940b011u,                           /* ldr w17, [x0, #176] */
+        0x5291c730u, 0x72a7fc70u,              /* mov w16, #0x3fe38e39 (16 / 9) */
+        0x6b10023fu,                           /* cmp w17, w16 */
+        BNE(c + 0x20, c + 0x28),
+        LIT(0x1c000000u, 2, c + 0x24, d + 8),  /* ldr s2, <page +0x108> */
+        B(c + 0x28, UW_MTX + 4),
+    };
+#undef LIT
+#undef BNE
+#undef B
+    memcpy(m->base + c, w, sizeof w);
+    uint32_t jump = 0x14000000u | ((uint32_t)((int64_t)(c - UW_MTX) >> 2) & 0x3ffffffu);
+    memcpy(m->base + UW_MTX, &jump, 4);
+    g_uw_page = m->base + data_off;
+    return 1;
 }
+static float uw_target(void) { return aspect_effective(aspect_step_ratio(atomic_load(&g_uw_step), bits_f(atomic_load(&g_uw_view)), g_uw_wide)); }
 static void botw_aspect_install(Module *m) {
-    float start = aspect_requested();
-    g_uw_wide = start ? start : (float)ASPECT_WIDE;
-    g_uw_main = m->base; atomic_store(&g_uw_on, start != 0);
-    fprintf(stderr, "[botw] 1.9.0 ultrawide: key 4 switches 16:9 / %.4f (TOTK_ASPECT), starts %s\n", g_uw_wide, start ? "wide" : "at 16:9");
+    double a = aspect_parse(getenv("TOTK_ASPECT"));
+    if (a == ASPECT_BAD) runtime_fail("TOTK_ASPECT must be display, <w>:<h>, <w>x<h> or a ratio between 0.5 and 8");
+    g_uw_wide = a > 0 ? a : ASPECT_WIDE;
+    g_uw_main = m->base;
+    if (!uw_cave(m)) fprintf(stderr, "[botw] aspect ratio: the projection matrix cave is not installed (layout); the field alone\n");
+    atomic_store(&g_uw_step, a == ASPECT_DISPLAY ? ASPECT_STEP_FIT : a > 0 ? ASPECT_STEP_WIDE : ASPECT_STEP_GAME);
+    fprintf(stderr, "[botw] 1.9.0 aspect ratio: key 4 cycles 16:9 -> fit to the window -> %.4f (TOTK_ASPECT), starts %s\n", g_uw_wide,
+            a == ASPECT_DISPLAY ? "fitting the window" : a > 0 ? "wide" : "at 16:9");
 }
 static void botw_aspect_apply(void) {
     if (!g_uw_main) return;
@@ -686,31 +895,43 @@ static void botw_aspect_apply(void) {
     uint64_t vt; memcpy(&vt, proj, 8);
     if (vt != (uintptr_t)g_uw_main + 0x1d05380) runtime_fail("ultrawide: the main camera is not a sead::PerspectiveProjection in this game version");
     float now; memcpy(&now, proj + 0xb0, 4);
-    const float game = 16.0f / 9.0f;
-    if (atomic_load(&g_uw_on)) {
-        if (now == g_uw_wide) return;
-        if (fabsf(now - game) > 1e-4f) {   /* not set up yet (the constructor's 4:3) or another ratio: left as it is */
-            static float told; if (now != told) { told = now; fprintf(stderr, "[botw] ultrawide: main camera aspect %g, not 16:9: left as it is\n", now); }
+    const float game = 16.0f / 9.0f, want = uw_target();
+    if (g_uw_page) {   /* the cave: the ratio first, then the projection it is for */
+        uint64_t p = want ? (uintptr_t)proj : 0;
+        __atomic_store_n((uint32_t *)(void *)(g_uw_page + UW_PAGE_WANT), *(const uint32_t *)(const void *)&want, __ATOMIC_RELEASE);
+        __atomic_store_n((uint64_t *)(void *)(g_uw_page + UW_PAGE_PROJ), p, __ATOMIC_RELEASE);
+    }
+    if (want) {
+        if (now == want) return;
+        if (fabsf(now - game) > 1e-4f && !(g_uw_put && now == g_uw_put)) {   /* not set up yet (the constructor's 4:3) or another ratio: left as it is */
+            static float told; if (now != told) { told = now; fprintf(stderr, "[botw] aspect ratio: main camera aspect %g, not 16:9: left as it is\n", now); }
             return;
         }
-        memcpy(proj + 0xb0, &g_uw_wide, 4); g_uw_written = 1;
+        if (g_uw_put && now != g_uw_put) { static int n; if (++n <= 3 || getenv("TOTK_ASPECT_LOG")) fprintf(stderr, "[botw] aspect ratio: t=%.2f the main camera %#llx at %g again (%d), %.4f put back\n", clock_gettime_nsec_np(CLOCK_UPTIME_RAW) * 1e-9, (unsigned long long)s, now, n, want); }
+        memcpy(proj + 0xb0, &want, 4); g_uw_put = want;
     } else {
-        if (!g_uw_written || now != g_uw_wide) return;   /* only the ratio this code wrote is put back */
-        memcpy(proj + 0xb0, &game, 4); g_uw_written = 0;
+        if (!g_uw_put || now != g_uw_put) return;   /* only the ratio this code wrote is put back */
+        memcpy(proj + 0xb0, &game, 4); g_uw_put = 0;
     }
     proj[8] = 1;   /* dirty: the matrix is rebuilt from the fields */
 }
-float runtime_aspect_now(void) { return g_uw_main && atomic_load(&g_uw_on) ? g_uw_wide : 0; }
+float runtime_aspect_now(void) { return g_uw_main ? uw_target() : 0; }
 int runtime_aspect_toggle(void) {
     if (!g_uw_main) return 0;
-    int on = !atomic_load(&g_uw_on); atomic_store(&g_uw_on, on);
-    fprintf(stderr, "[botw] key 4: aspect ratio %s\n", on ? "wide" : "16:9 (the game's own)");
+    int step = aspect_next_step(atomic_load(&g_uw_step), bits_f(atomic_load(&g_uw_view)), g_uw_wide);
+    atomic_store(&g_uw_step, step);
+    float a = uw_target();
+    if (step == ASPECT_STEP_GAME) fprintf(stderr, "[botw] key 4: 16:9 (the game's own)\n");
+    else fprintf(stderr, "[botw] key 4: %s, aspect ratio %.4f%s\n", step == ASPECT_STEP_FIT ? "fit to the window" : "wide", a ? a : 16.0 / 9.0,
+                 step == ASPECT_STEP_FIT ? "; the view follows the window" : "");
     return 1;
 }
-/* Upstream's key 4 (#120) cycles 16:9 -> fit to the window -> 21:9 for TOTK; on 1.9.0 key 4 switches 16:9 / wide only, so
-   the panel sees step 0 or 2 and the window size is not followed. */
-int runtime_aspect_step(void) { return g_uw_main ? (atomic_load(&g_uw_on) ? 2 : 0) : -1; }
-void runtime_aspect_view(double w, double h) { (void)w; (void)h; }
+int runtime_aspect_step(void) { return g_uw_main ? atomic_load(&g_uw_step) : -1; }
+/* the window's drawable is w x h pixels (on every change); while key 4 fits the window the next present follows it */
+void runtime_aspect_view(double w, double h) {
+    if (!(w > 0 && h > 0)) return;
+    float v = (float)(w / h); uint32_t b; memcpy(&b, &v, 4); atomic_store(&g_uw_view, b);
+}
 #else
 float runtime_aspect_now(void) { return 0; }
 int runtime_aspect_toggle(void) { return 0; }

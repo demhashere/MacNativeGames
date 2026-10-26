@@ -19,7 +19,7 @@
    The slot directory is TOTK_GAME_SLOT_DIR, else analysis/game-slot next to this binary's build/ directory; every
    worktree links analysis/ to the main checkout (scripts/dev/new_worktree.sh), so all checkouts share one slot. */
 #include <TargetConditionals.h>
-#if TARGET_OS_IPHONE
+#if TARGET_OS_IPHONE || defined(__linux__)
 #include "runtime.h"
 /* One app per phone: the slot only exists to keep several games off one Mac. */
 void runtime_game_slot_acquire(const char *mode) { (void)mode; }

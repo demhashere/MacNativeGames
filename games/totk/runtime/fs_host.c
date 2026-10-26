@@ -17,6 +17,14 @@
 #include <stdatomic.h>
 #include <sys/stat.h>
 #include <unistd.h>
+/* Darwin's F_FULLFSYNC also flushes the drive's cache; Linux fsync does that already. */
+static int totk_full_fsync(int fd) {
+#ifdef F_FULLFSYNC
+    return fcntl(fd, F_FULLFSYNC);
+#else
+    return fsync(fd);
+#endif
+}
 
 #define R_PATH_NOT_FOUND 0x202u
 #define R_ALREADY_EXISTS 0x402u
@@ -183,7 +191,7 @@ static unsigned commit(const char *name) {
     for (int i = 0; i < 16; i++) if (mounts[i].kind && !strcmp(mounts[i].name, name)) { found = 1; save = mounts[i].kind == M_SAVE; }
     pthread_mutex_unlock(&lock);
     if (!found) return R_PATH_NOT_FOUND;
-    for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) fcntl(fd, F_FULLFSYNC); }
+    for (int i = 0; i < NFILES; i++) { pthread_mutex_lock(&lock); int fd = files[i].fd; pthread_mutex_unlock(&lock); if (fd > 0) totk_full_fsync(fd); }
     if (save && !(getenv("TOTK_PROBE_NEGATIVE") && atoi(getenv("TOTK_PROBE_NEGATIVE")) == 23)) atomic_store(&save_dirty, 0);   /* 23: probe-save's negative control */
     return 0;
 }
@@ -236,7 +244,7 @@ static unsigned write_file(uint64_t h, int64_t offset, const void *buffer, uint6
         if (delay_ms > 0) usleep((useconds_t)delay_ms * 1000);   /* tests only: slow saves down so a window close lands in the middle of one */
     }
     while (done < size) { ssize_t n = pwrite(fd, (const uint8_t *)buffer + done, (size_t)(size - done), offset + (off_t)done); if (n <= 0) runtime_fail("host save write failure"); done += (uint64_t)n; }
-    if (option && (*option & 1)) fcntl(fd, F_FULLFSYNC);
+    if (option && (*option & 1)) totk_full_fsync(fd);
     return 0;
 }
 static unsigned file_size(int64_t *out, uint64_t h) {
@@ -250,7 +258,7 @@ static unsigned set_file_size(uint64_t h, int64_t size) {
     if (files[h - FILE_BASE].save) save_touched();
     return ftruncate(fd, size) ? errno_result() : 0;
 }
-static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; fcntl(fd, F_FULLFSYNC); return 0; }
+static unsigned flush_file(uint64_t h) { int fd; if (!file_of(h, &fd, NULL)) return R_INVALID_ARGUMENT; totk_full_fsync(fd); return 0; }
 static void close_file(uint64_t h) {
     if (runtime_romfs_handle(h)) { runtime_romfs_close(h); return; } BOTW_AOC_CLOSE(h)
     if (!file_of(h, NULL, NULL)) runtime_fail("close invalid file handle");

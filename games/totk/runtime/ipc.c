@@ -194,7 +194,7 @@ int runtime_ipc_svc(unsigned num, uint64_t *r) {
         uint32_t h = (uint32_t)(num == 0x21 ? r[0] : r[2]);
         IpcSession *s = runtime_handle_get(h, 1);
         if (!s) { r[0] = 0xe401; return 1; }
-        uint32_t *m = num == 0x21 ? pthread_getspecific(runtime_keys[2]) : (uint32_t *)(uintptr_t)r[0];
+        uint32_t *m = num == 0x21 ? RUNTIME_SLOT_GET(2) : (uint32_t *)(uintptr_t)r[0];
         if (!m || (num == 0x22 && r[1] < MSG_BYTES)) runtime_fail("IPC message buffer");
         trace_fp = r[29]; trace_lr = r[30];
         dispatch(s, m); r[0] = 0; return 1;

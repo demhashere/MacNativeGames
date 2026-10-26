@@ -26,6 +26,7 @@
 #include "nvn_hmap.h"
 #include "nvn_mtl.h"
 #include "nvn_pace.h"
+#include "nvn_fhold.h"
 #include "nvn_diag_range.h"
 #include "../../host/front.h"
 #include "nvn_dirty.h"
@@ -633,7 +634,14 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     uint64_t t0 = lg ? now_ns() : 0;
     totk_tl(TL_WAIT_IN, o->fence, o->fence == mtl_last_fence());
     if (sync_chain_left(1)) { char w[96]; snprintf(w, sizeof w, "SyncWait sync=%p fence=%llu newest=%d", (const void *)s, (unsigned long long)o->fence, o->fence == mtl_last_fence()); guest_chain(w); }
-    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(o->fence, timeout);
+    /* TOTK_SYNC_LAG=1 (Linux, synchronous replay): a wait for the newest submission's fence (Breath of the Wild, once a
+       frame) waits for the fence the previous such wait asked for instead, so the GPU renders frame N while the game
+       records N + 1 instead of the two taking turns (linux/vk/vk_tex.c writes the read-back renderings into memory when
+       they complete, so nothing else in the frame waits for the newest one). */
+    static int lag = -1; if (lag < 0) { const char *e = getenv("TOTK_SYNC_LAG"); lag = e && !strcmp(e, "1"); }
+    uint64_t want = o->fence;
+    if (lag && !tok && o->fence == mtl_last_fence()) { static _Atomic uint64_t prev; uint64_t p = atomic_exchange(&prev, o->fence); if (p && p < o->fence) want = p; }
+    int ok = tok ? fence_wait(o->fence, timeout) : mtl_wait(want, timeout);
     totk_tl(TL_WAIT_OUT, o->fence, ok);
     if (lg) { atomic_fetch_add(&g_sw_blocked[k], 1); atomic_fetch_add(&g_sw_ns[k], now_ns() - t0); }
     if (ok) survey_after_wait(s);
@@ -2341,7 +2349,42 @@ static int g_paced_hz;   // the display-following rate, used instead of the unca
    mode, without the interpolation. Weak: Tears of the Kingdom has none. */
 __attribute__((weak)) int runtime_game_fps_limit(void) { return 0; }
 static int game_holds_30(void) { return runtime_game_fps_limit() == 30; }
-static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_holds_30() && (m == MFX_OFF || m == MFX_MAX); }
+/* Frame hold (Linux: TOTK_FRAME_HOLD, default on; =strict: only 60 or 30; =0 off; F7 cycles on -> strict -> off while
+   playing). After nxnative's frame step: each frame stays on screen for whole vsyncs of 1/60 s, k of them (nvn_fhold.h
+   decides k from the frames' cost), the game is paced to the display's vblanks (vk_present.c's vblank clock from the
+   compositor's presentation times, else its own clock at k vsyncs), and a frame on time hands the game a time step of
+   exactly k vsyncs (runtime_frame_step_hold), so motion is even. It replaces the uncapped mode while on: at most 60 fps,
+   no frames the display never shows. Off on displays whose rate is not a multiple of 60 Hz, without a window, under the
+   deterministic clock and while MetalFX interpolation paces the game. */
+__attribute__((weak)) void runtime_frame_step_hold(double seconds) { (void)seconds; }
+__attribute__((weak)) uint64_t vk_vblank_period(void) { return 0; }
+__attribute__((weak)) void vk_present_timing_stats(uint64_t *answers, uint64_t *dropped) { *answers = *dropped = 0; }
+static _Atomic int g_fh_mode = -1;   /* 0 off, 1 on, 2 strict */
+static nvn_fhold g_fh;               /* the game's present thread */
+static _Atomic int g_fh_k;           /* vsyncs a frame stays on screen (0: not decided yet) */
+static uint64_t g_fh_start, g_fh_wait, g_fh_prev;   /* this frame's start (the first acquire after a present returned) and its pacing wait; the last frame's start */
+static int fh_mode(void) {
+    int m = atomic_load(&g_fh_mode);
+    if (m < 0) { const char *e = getenv("TOTK_FRAME_HOLD"); m = !e || !*e ? 1 : !strcmp(e, "strict") ? 2 : (!strcmp(e, "0") || !strcmp(e, "off")) ? 0 : 1; atomic_store(&g_fh_mode, m); }
+    return m;
+}
+static int fh_ticks(void) {   /* display refreshes per vsync of 1/60 s: 1 at 60 Hz, 2 at 120 Hz; 0 at a rate that is not a multiple of 60 */
+    uint64_t p = vk_vblank_period(); int hz = p ? (int)lround(1e9 / (double)p) : mtl_display_hz();
+    if (hz <= 0) hz = 60;
+    int t = (hz + 30) / 60; return t > 0 && abs(hz - 60 * t) <= 2 ? t : 0;
+}
+int nvn_frame_hold_now(void) {
+#ifdef TOTK_LINUX
+    return fh_mode() && mtl_has_window() && !dm_detclock_enabled() && mfx_enabled() == MFX_OFF && fh_ticks() > 0;
+#else
+    return 0;
+#endif
+}
+void nvn_frame_hold_toggle(void) {   /* F7 (linux/frontend_sdl.c) */
+    int m = (fh_mode() + 1) % 3; atomic_store(&g_fh_mode, m);
+    LOG("[nvn] F7: frame hold %s", m == 1 ? "on: 60 when it holds, as fast as it can down to about 44 fps, an even 30 below" : m == 2 ? "strict: 60, or an even 30 as soon as 60 does not hold" : "off: frames as fast as they come (up to the uncapped clock), as before");
+}
+static int uncapped_now(void) { int m = mfx_enabled(); return g_uncapped && !game_holds_30() && (m == MFX_OFF || m == MFX_MAX) && !nvn_frame_hold_now(); }
 /* 30+30 on a display whose rate is not a multiple of 30 (the user's 100 Hz): the game is paced by our own clock at exactly
    30 fps instead of by the display link (3 refreshes would be 33 fps); the display link still shows each picture at a refresh. */
 static int mfx_own_clock(void) { return (mfx_enabled() == MFX_30 || game_holds_30()) && (g_paced_hz <= 0 || g_paced_hz % 30); }
@@ -2384,8 +2427,10 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(period); }
         rt_comp_tick(period);
+        uint64_t p0 = now_ns();
         if (mtl_link_active() && !uncapped_now() && !mfx_own_clock()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull, present_ticks(o)) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
+        if (!g_fh_start) { g_fh_start = now_ns(); g_fh_wait = g_fh_start - p0; }   /* frame hold: the frame starts when the first acquire after a present returns */
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
                // 机器满载时帧只会更慢、后台得到的墙钟只会更多，所以「消息后第 N 帧」截到的画面与负载无关
                // When the machine is fully loaded frames only get slower and the background only gets more wall clock, so the picture captured at "the Nth frame after the message" is independent of load
@@ -2728,6 +2773,7 @@ static unsigned present_ticks(const win_t *o) {   /* display ticks per game fram
     int m = mfx_enabled();
     if (m == MFX_HALF && !game_holds_30()) return 2;
     if (m == MFX_30 || game_holds_30()) { int hz = g_paced_hz > 0 ? g_paced_hz : 60; return (unsigned)(hz >= 45 ? (hz + 15) / 30 : 1); }
+    if (nvn_frame_hold_now()) { int k = atomic_load(&g_fh_k); return (unsigned)((k ? k : 1) * fh_ticks()); }   /* the frame hold's k vsyncs, in display refreshes */
     return g_display_mode || (uncapped_now() && !dm_detclock_enabled() && uncapped_interval_on()) || o->interval <= 0 ? 1u : (unsigned)o->interval;
 }
 static uint64_t present_period(const win_t *o) {
@@ -2795,6 +2841,42 @@ void dm_nvn_probe_present_interval(void) {
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 // The present itself: screenshot hook, then the present queue (returns at once). frame != 0 (translation thread): also the
 // replay frame number, which the synchronous path sets at the end of nvnQueuePresentTexture.
+/* Once per present (frame hold): the time since the last frame's start (shown) and the frame's cost, max(CPU: that time
+   without the pacing wait, GPU: the latest finished frame's GPU time), in vsyncs, decide the next frame's hold and step */
+static void fhold_tick(const win_t *o) {
+    static int was, nlog, kmin_was, linked; static uint64_t held[FH_MAX + 1], t0, a0, d0;
+    if (!nvn_frame_hold_now()) {
+        if (was) { was = 0; runtime_frame_step_hold(0); g_fh = (nvn_fhold){0}; atomic_store(&g_fh_k, 0); g_fh_prev = 0; }
+        g_fh_start = g_fh_wait = 0; return;
+    }
+    int ticks = fh_ticks(); uint64_t p = vk_vblank_period();
+    double v = p ? (double)p * ticks : 1e9 / 60;   /* a vsync of 1/60 s, as the display counts it */
+    if (was && was != fh_mode()) was = 0;   /* F7 between on and strict: the other mode's margins, from 60 again */
+    if (!was) { was = fh_mode(); g_fh = (nvn_fhold){0}; linked = 0; nvn_fhold_mode(&g_fh, fh_mode() == 2); g_fh_prev = 0; memset(held, 0, sizeof held); t0 = 0;
+                LOG("[nvn] frame hold %s (TOTK_FRAME_HOLD%s; F7 switches): frames held whole vsyncs of %.3f ms, paced by %s", fh_mode() == 2 ? "strict" : "on",
+                    fh_mode() == 2 ? "=strict" : "", v / 1e6, mtl_link_active() ? "the display's vblanks" : "our own clock until the compositor reports presentation times"); }
+    if (!linked && mtl_link_active()) { linked = 1; LOG("[nvn] frame hold: paced by the display's vblanks from present %llu (the compositor's presentation times)", (unsigned long long)o->presents); }
+    uint64_t st = g_fh_start ? g_fh_start : now_ns(), pw = g_fh_wait; g_fh_start = g_fh_wait = 0;
+    double shown = g_fh_prev ? (double)(st - g_fh_prev) / v : 0, gpu = 0; g_fh_prev = st;
+    for (uint64_t f = g_frame; f-- > 0 && g_frame - f <= 8;) { double g = mtl_gpu_ms(f); if (g >= 0) { gpu = g * 1e6 / v; break; } }
+    double cpu = shown - pw / v, cost = cpu > gpu ? cpu : gpu;
+    int kmin = game_holds_30() ? 2 : 1, k0 = g_fh.k; uint64_t ups0 = g_fh.ups, failed0 = g_fh.failed;
+    int ontime = shown > 0 && shown < 30 ? nvn_fhold_next(&g_fh, shown, cost, kmin, FH_MAX) : (g_fh.k ? 0 : nvn_fhold_next(&g_fh, 0, 0, kmin, FH_MAX), 0);
+    atomic_store(&g_fh_k, g_fh.k); held[g_fh.k <= FH_MAX ? g_fh.k : FH_MAX]++;
+    int kmin_was_ = kmin_was; kmin_was = kmin;
+    runtime_frame_step_hold(ontime ? g_fh.k * v / 1e9 : 0);   /* the next frame's step: exactly its hold after a frame on time, else the measured average */
+    if (k0 && g_fh.k != k0 && nlog < 40)
+        LOG("[nvn] frame hold %d -> %d vsyncs (%.0f fps) at present %llu (%s; cost %.2f vsyncs, GPU %.2f)%s", k0, g_fh.k, 60.0 / g_fh.k, (unsigned long long)o->presents,
+            g_fh.ups != ups0 ? (g_fh.failed != failed0 ? "3 frames too slow, the trial failed" : "3 frames too slow") : kmin != kmin_was_ ? "a movie's 30 fps began or ended" : "trial",
+            cost, gpu, ++nlog == 40 ? "; further changes only counted" : "");
+    if (o->presents % 1800 == 0) {
+        uint64_t t = now_ns(), a, d; vk_present_timing_stats(&a, &d);
+        if (t0) LOG("[nvn] frame hold, last %.0f s: held 1 / 2 / 3 vsyncs %llu / %llu / %llu frames, %.0f%% on time; %llu up / %llu down, %llu failed trials; presentation times %llu, %llu dropped by the compositor",
+                    (t - t0) / 1e9, (unsigned long long)held[1], (unsigned long long)held[2], (unsigned long long)held[3], g_fh.frames ? 100.0 * g_fh.ontime / g_fh.frames : 0,
+                    (unsigned long long)g_fh.ups, (unsigned long long)g_fh.downs, (unsigned long long)g_fh.failed, (unsigned long long)(a - a0), (unsigned long long)(d - d0));
+        t0 = t; a0 = a; d0 = d; memset(held, 0, sizeof held); g_fh.frames = g_fh.ontime = 0;
+    }
+}
 static void present_exec(win_t *o, int idx, double period, const int crop[4], uint64_t frame) {
     gfx_enter();
     { void mtl_shot_at_present(const tex_t *t); if (idx >= 0 && idx < o->ntex && idx < 4) mtl_shot_at_present(CTX(o->tex[idx])); }
@@ -2806,6 +2888,7 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     NVN_BLOCKING();
     (void)q; win_t *o = (win_t *)w; o->presents++;
     totk_tl_frame(o->presents); totk_tl(TL_PRES_IN, (uint64_t)idx, 0);
+    fhold_tick(o);   /* before the frame step: it sets the next frame's step */
     if (runtime_frame_step_update) runtime_frame_step_update(now_ns());
     if (movie_host_tick) movie_host_tick();
     game_work_tick(o->presents);

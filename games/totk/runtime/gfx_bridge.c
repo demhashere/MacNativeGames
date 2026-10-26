@@ -1,4 +1,11 @@
 /* Bind the donor graphics interface to this native runtime, without donor game hooks. */
+#ifndef MNG_DATA_SECTION
+#ifdef __APPLE__
+#define MNG_DATA_SECTION(name) "__DATA," #name
+#else
+#define MNG_DATA_SECTION(name) #name   /* ELF: found through the linker's __start_ / __stop_ symbols */
+#endif
+#endif
 #include "runtime.h"
 #include <mach-o/getsect.h>
 #include <mach-o/ldsyms.h>
@@ -30,7 +37,7 @@ void dm_guest_write_prepare(void *addr,size_t n){dm_host_write_pc=(uint64_t)__bu
 #include <unistd.h>
 #include <mach/mach.h>
 #include "mach_vm_compat.h"
-#include <sys/ucontext.h>
+#include "mng_ucontext.h"
 static uintptr_t watch_lo,watch_hi,watch_addr,watch_end;static long watch_from=300;static int watch_hits,watch_init,watch_read;
 static unsigned char watch_snap[32];static int watch_snap_valid;static _Atomic int watch_armed;   /* TOTK: content poll at every present + periodic re-arm (an unrelated write in the page unprotects it; without re-arm the block's own write in the same frame is missed) */
 static void *watch_rearm_thread(void *arg){(void)arg;for(;;){usleep(100);if(watch_lo&&atomic_load(&watch_armed))mprotect((void *)watch_lo,watch_hi-watch_lo,watch_read?PROT_NONE:PROT_READ);}return NULL;}
@@ -60,8 +67,8 @@ static int watch_fault(void *addr,int is_write,void *context){
  { extern uint64_t g_frame_pub; extern _Atomic int dm_submit_busy; uint64_t th=0; pthread_threadid_np(NULL,&th);
    watch_hex(b,&n,"[watch] F",g_frame_pub);watch_hex(b,&n," t_us=",clock_gettime_nsec_np(CLOCK_UPTIME_RAW)/1000);watch_hex(b,&n," th=",th);watch_hex(b,&n," submit_busy=",(uint64_t)atomic_load(&dm_submit_busy)); }
  watch_hex(b,&n,is_write?" write hit addr=":" read hit addr=",a);watch_hex(b,&n," off=",a-watch_addr);
- watch_sym(b,&n," pc=",u->uc_mcontext->__ss.__pc);watch_sym(b,&n," lr=",u->uc_mcontext->__ss.__lr);
- uint64_t fp=u->uc_mcontext->__ss.__fp;for(int d=0;d<8&&fp&&!(fp&15);d++){uint64_t fr[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)fr,&got)!=KERN_SUCCESS||got!=16)break;watch_sym(b,&n," <",fr[1]);fp=fr[0];}
+ watch_sym(b,&n," pc=",UC_PC(u));watch_sym(b,&n," lr=",UC_LR(u));
+ uint64_t fp=UC_FP(u);for(int d=0;d<8&&fp&&!(fp&15);d++){uint64_t fr[2];mach_vm_size_t got=0;if(mach_vm_read_overwrite(mach_task_self(),fp,16,(uintptr_t)fr,&got)!=KERN_SUCCESS||got!=16)break;watch_sym(b,&n," <",fr[1]);fp=fr[0];}
  b[n++]='\n';write(2,b,n);watch_hits++;
  mprotect((void *)watch_lo,watch_hi-watch_lo,PROT_READ|PROT_WRITE);return 1;
 }
@@ -81,6 +88,6 @@ static void graphics_dev_allocator(Alloc a,Free f,Realloc r,void *u){g_nv_devtoo
 static void graphics_initialize(void *mem,unsigned long size){
  if(!mem||!size)runtime_fail("invalid graphics work memory");g_t0_ns=runtime_now_ns();mtl_init();fprintf(stderr,"[totk] native Metal graphics context initialized\n");
 }
-__attribute__((used,section("__DATA,totkgfx"))) static const GfxEntry init_entry={"_ZN2nv18InitializeGraphicsEPvm",graphics_initialize,"native Metal context"};
-__attribute__((used,section("__DATA,totkgfx"))) static const GfxEntry alloc_entry={"_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_",graphics_allocator,"game allocator callbacks"};
-__attribute__((used,section("__DATA,totkgfx"))) static const GfxEntry dev_alloc_entry={"_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_",graphics_dev_allocator,"game diagnostic allocator callbacks"};
+__attribute__((used,section(MNG_DATA_SECTION(totkgfx)))) static const GfxEntry init_entry={"_ZN2nv18InitializeGraphicsEPvm",graphics_initialize,"native Metal context"};
+__attribute__((used,section(MNG_DATA_SECTION(totkgfx)))) static const GfxEntry alloc_entry={"_ZN2nv20SetGraphicsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_",graphics_allocator,"game allocator callbacks"};
+__attribute__((used,section(MNG_DATA_SECTION(totkgfx)))) static const GfxEntry dev_alloc_entry={"_ZN2nv28SetGraphicsDevtoolsAllocatorEPFPvmmS0_EPFvS0_S0_EPFS0_S0_mS0_ES0_",graphics_dev_allocator,"game diagnostic allocator callbacks"};

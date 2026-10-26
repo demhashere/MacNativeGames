@@ -2,8 +2,10 @@
 #ifdef __APPLE__
 #include <TargetConditionals.h>
 #endif
+#ifdef __APPLE__
 #include <CoreGraphics/CoreGraphics.h>
 #include <CoreText/CoreText.h>
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -86,6 +88,7 @@ static void draw_text(uint8_t *out, int stride, const char *text, int n, int sca
     }
 }
 
+#ifdef __APPLE__
 /* A line with characters the 5x7 font does not have (Chinese labels, user 2026-10-17: "MetalFX已开启", "新着色器 N / 总计 M")
    in the system font (CoreText), with the same box height, padding and colours as the pixel font at this scale; the
    scale drops until the line fits the texture. */
@@ -128,6 +131,48 @@ static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *
     CGColorRelease(color); CGColorSpaceRelease(cs); CFRelease(str);
 }
 
+#else
+/* Linux: no CoreText. Such a line is drawn in the 5x7 font after all, upper-cased, with the letters the labels lack
+   added here (Chinese text does not occur: TOTK_UI is English unless the locale is Chinese). */
+static const Glyph FONT_EXTRA[] = {
+    {'B', {0x1e, 0x11, 0x11, 0x1e, 0x11, 0x11, 0x1e}}, {'C', {0x0e, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0e}},
+    {'I', {0x0e, 0x04, 0x04, 0x04, 0x04, 0x04, 0x0e}}, {'J', {0x07, 0x02, 0x02, 0x02, 0x02, 0x12, 0x0c}},
+    {'L', {0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1f}}, {'N', {0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11}},
+    {'Q', {0x0e, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0d}}, {'V', {0x11, 0x11, 0x11, 0x11, 0x11, 0x0a, 0x04}},
+    {'W', {0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0a}}, {'Y', {0x11, 0x11, 0x0a, 0x04, 0x04, 0x04, 0x04}},
+    {'Z', {0x1f, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1f}}, {'.', {0x00, 0x00, 0x00, 0x00, 0x00, 0x0c, 0x0c}},
+    {':', {0x00, 0x0c, 0x0c, 0x00, 0x0c, 0x0c, 0x00}}, {',', {0x00, 0x00, 0x00, 0x00, 0x0c, 0x04, 0x08}},
+    {'=', {0x00, 0x00, 0x1f, 0x00, 0x1f, 0x00, 0x00}}, {'?', {0x0e, 0x11, 0x01, 0x02, 0x04, 0x00, 0x04}},
+};
+static void draw_text_any(uint8_t *out, int stride, const char *text, int n, int scale, const uint8_t color[4]) {
+    char up[MAX_CHARS + 1]; int k = 0;
+    for (int i = 0; i < n && k < MAX_CHARS; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0x80) { while (i + 1 < n && ((unsigned char)text[i + 1] & 0xc0) == 0x80) i++; c = '?'; }   /* one ? per UTF-8 character */
+        if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 32);
+        up[k++] = (char)c;
+    }
+    for (int i = 0; i < k; i++) {
+        const Glyph *g = glyph(up[i]);
+        if (g == &FONT[sizeof FONT / sizeof FONT[0] - 1] && up[i] != ' ')
+            for (size_t e = 0; e < sizeof FONT_EXTRA / sizeof FONT_EXTRA[0]; e++) if (FONT_EXTRA[e].c == up[i]) { g = &FONT_EXTRA[e]; break; }
+        for (int y = 0; y < GLYPH_H; y++) for (int x = 0; x < GLYPH_W; x++)
+            if (g->rows[y] & (0x10 >> x)) fill(out, stride, (PAD + i * ADVANCE + x) * scale, (PAD + y) * scale, scale, scale, color);
+    }
+}
+static void raster_line_ct(const char *text, int highlight, int scale, uint8_t *out, int tex_w, int tex_h, int *box_w, int *box_h) {
+    int n = 0; for (const unsigned char *p = (const unsigned char *)text; *p && n < MAX_CHARS; p++) if ((*p & 0xc0) != 0x80) n++;
+    if (scale < 1) scale = 1;
+    if (scale > FPS_OVERLAY_MAX_SCALE) scale = FPS_OVERLAY_MAX_SCALE;
+    while (scale > 1 && ((n * ADVANCE - 1 + 2 * PAD) * scale > tex_w || BOX_ROWS * scale > tex_h)) scale--;
+    while (n > 1 && (n * ADVANCE - 1 + 2 * PAD) > tex_w) n--;
+    int w = (n * ADVANCE - 1 + 2 * PAD) * scale, h = BOX_ROWS * scale;
+    memset(out, 0, (size_t)tex_w * tex_h * 4);
+    fill(out, tex_w, 0, 0, w, h, BOX_BGRA);
+    draw_text_any(out, tex_w, text, (int)strnlen(text, 4 * MAX_CHARS), scale, highlight ? HIGHLIGHT_BGRA : TEXT_BGRA);
+    *box_w = w; *box_h = h;
+}
+#endif
 /* The 5x7 font has only the letters the original labels use: any other character (Chinese, or English words such as
    "New shaders ... / total ...") sends the whole line to the system font instead of drawing blanks. */
 int fps_overlay_line_pixel_font(const char *s) {
@@ -172,8 +217,8 @@ void fps_overlay_raster(const fps_overlay_info *info, int scale, uint8_t *out, i
 
 int hud_compact(void) {
     static int on = -1;
-#if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-    const int def = 0;   // the iOS frontend has no corner panel
+#if (defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) || defined(__linux__)
+    const int def = 0;   // the iOS and Linux frontends have no corner panel: the lines go into the picture's corners
 #else
     const int def = 1;
 #endif

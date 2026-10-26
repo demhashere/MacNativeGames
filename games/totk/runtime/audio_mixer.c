@@ -13,7 +13,11 @@
 #include "audio_mixer.h"
 #include "audio_reverb.h"
 #include "audio_effects.h"
+#ifdef __APPLE__
 #include <AudioToolbox/AudioToolbox.h>
+#else
+#include <SDL3/SDL.h>   /* Linux: SDL3 audio stream (PipeWire / PulseAudio / ALSA) in place of the CoreAudio output unit */
+#endif
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -36,7 +40,12 @@ typedef struct Mixer {
     float *buf; int nbuf, frame;
     int *offset;                                   /* first mix buffer of each mix id */
     SplitInfo *split; int nsplit; SplitDest *dest; int ndest;
-    AudioComponentInstance unit; int unit_ok, rate;
+#ifdef __APPLE__
+    AudioComponentInstance unit;
+#else
+    SDL_AudioStream *unit;
+#endif
+    int unit_ok, rate;
     float ring[RING_FRAMES * 2]; _Atomic uint64_t wr, rd, underruns, overruns;
     _Atomic int playing; int ready; _Atomic uint64_t missing_frames, trims, trimmed_frames;
     _Atomic uint64_t flush_until; _Atomic unsigned stop_epoch; unsigned callback_epoch;
@@ -106,21 +115,20 @@ static int prefill_blocks(void) {   // read once before the device starts (audio
     }
     return blocks;
 }
-static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
-    (void)flags; (void)ts; (void)bus;
-    Mixer *m = ctx; float *out = io->mBuffers[0].mData;
+typedef uint32_t UInt32_;
+static void pull_frames(Mixer *m, float *out, UInt32_ frames) {
     atomic_fetch_add(&m->callback_frames,frames);
     unsigned epoch=atomic_load_explicit(&m->stop_epoch,memory_order_acquire);
     uint64_t rd = atomic_load(&m->rd), wr = atomic_load_explicit(&m->wr, memory_order_acquire), have = wr - rd;
     if(epoch!=m->callback_epoch){uint64_t until=atomic_load_explicit(&m->flush_until,memory_order_acquire);if(until>rd){rd=until<wr?until:wr;atomic_store_explicit(&m->rd,rd,memory_order_release);}have=wr-rd;m->callback_epoch=epoch;m->ready=0;}
     if(!atomic_load_explicit(&m->playing,memory_order_acquire)){
-        memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return noErr;
+        memset(out,0,(size_t)frames*2*sizeof(float));m->ready=0;atomic_store_explicit(&m->rd,wr,memory_order_release);return;
     }
     uint64_t prefill=(uint64_t)m->frame*(uint64_t)prefill_blocks();if(prefill<frames)prefill=frames;if(prefill>RING_FRAMES)prefill=RING_FRAMES;
     if(!m->ready){
         /* prefill_blocks() 5-ms blocks (default four, 20 ms) of scheduling headroom for the producer.
            A real underrun still counts and requires a fresh prefill. */
-        if(have<prefill){memset(out,0,(size_t)frames*2*sizeof(float));return noErr;}
+        if(have<prefill){memset(out,0,(size_t)frames*2*sizeof(float));return;}
         m->ready=1;
     }
     /* After a device stall (Bluetooth, CoreAudio) the producer, paced by the wall clock, keeps the backlog it built up:
@@ -131,16 +139,36 @@ static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTi
         rd = wr - prefill;
         have = prefill;
     }
-    UInt32 n = frames < have ? frames : (UInt32)have;
+    UInt32_ n = frames < have ? frames : (UInt32_)have;
     uint64_t nonzero=0;
-    for (UInt32 i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1];if(out[2*i]!=0 || out[2*i+1]!=0)nonzero++; }
+    for (UInt32_ i = 0; i < n; i++) { uint64_t k = (rd + i) % RING_FRAMES; out[2 * i] = m->ring[2 * k]; out[2 * i + 1] = m->ring[2 * k + 1];if(out[2*i]!=0 || out[2*i+1]!=0)nonzero++; }
     atomic_fetch_add(&m->callback_nonzero,nonzero);
     if (n < frames) { memset(out + 2 * n, 0, (frames - n) * 2 * sizeof(float));atomic_fetch_add(&m->underruns,1);atomic_fetch_add(&m->missing_frames,frames-n);m->ready=0; }
     atomic_store_explicit(&m->rd, rd + n, memory_order_release);
+    return;
+}
+#ifdef __APPLE__
+static OSStatus pull(void *ctx, AudioUnitRenderActionFlags *flags, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *io) {
+    (void)flags; (void)ts; (void)bus;
+    pull_frames(ctx, io->mBuffers[0].mData, frames);
     return noErr;
 }
+#else
+/* SDL asks for additional bytes of interleaved stereo float: produce them with the same ring logic as the CoreAudio callback. */
+static void sdl_pull(void *ctx, SDL_AudioStream *stream, int additional, int total) {
+    (void)total;
+    float buf[2048 * 2];
+    while (additional > 0) {
+        int frames = additional / (int)(2 * sizeof(float)); if (frames <= 0) break; if (frames > 2048) frames = 2048;
+        pull_frames(ctx, buf, (UInt32_)frames);
+        SDL_PutAudioStreamData(stream, buf, frames * (int)(2 * sizeof(float)));
+        additional -= frames * (int)(2 * sizeof(float));
+    }
+}
+#endif
 static void output_open(Mixer *m, int rate) {
     if (getenv("TOTK_AUDIO_OFF")) { fprintf(stderr, "[totk-audio] TOTK_AUDIO_OFF: mixing without a CoreAudio device\n"); return; }
+#ifdef __APPLE__
 #if TARGET_OS_IPHONE
     AudioComponentDescription d = {kAudioUnitType_Output, kAudioUnitSubType_RemoteIO, kAudioUnitManufacturer_Apple, 0, 0};   /* session set up by the app */
 #else
@@ -156,6 +184,30 @@ static void output_open(Mixer *m, int rate) {
         fprintf(stderr, "[totk-audio] 【红】CoreAudio output setup failed: mixing without sound\n"); AudioComponentInstanceDispose(m->unit); return;
     }
     m->unit_ok = 1; fprintf(stderr, "[totk-audio] CoreAudio output %d Hz stereo\n", rate);
+#else
+    /* The device buffer of the CoreAudio output was 512 frames (10.7 ms at 48 kHz): ask SDL for the same. */
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "512");
+    if (!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO)) { fprintf(stderr, "[totk-audio] 【红】SDL audio: %s: mixing without sound\n", SDL_GetError()); return; }
+    SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, rate};
+    m->unit = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_pull, m);
+    if (!m->unit) { fprintf(stderr, "[totk-audio] 【红】no default output device (%s): mixing without sound\n", SDL_GetError()); return; }
+    if (!SDL_ResumeAudioStreamDevice(m->unit)) { fprintf(stderr, "[totk-audio] 【红】SDL audio start failed (%s): mixing without sound\n", SDL_GetError()); SDL_DestroyAudioStream(m->unit); m->unit = NULL; return; }
+    m->unit_ok = 1; fprintf(stderr, "[totk-audio] SDL audio output %d Hz stereo (%s)\n", rate, SDL_GetCurrentAudioDriver());
+#endif
+}
+static int output_start(Mixer *m) {
+#ifdef __APPLE__
+    return !AudioOutputUnitStart(m->unit);
+#else
+    return SDL_ResumeAudioStreamDevice(m->unit);
+#endif
+}
+static void output_dispose(Mixer *m) {
+#ifdef __APPLE__
+    AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit);
+#else
+    SDL_DestroyAudioStream(m->unit); m->unit = NULL;
+#endif
 }
 /* iOS (from nxnative b301431): the system stops the RemoteIO unit when another app takes the audio session (a call,
    Siri, an alarm) and invalidates it when media services are reset. Nothing started it again, so the game stayed
@@ -167,8 +219,8 @@ void runtime_audio_output_restart(int recreate) {
     pthread_mutex_lock(&g_out_mu);
     for (int i = 0; i < 4; i++) {
         Mixer *m = g_out[i]; if (!m) continue;
-        if (m->unit_ok && !recreate && !AudioOutputUnitStart(m->unit)) { fprintf(stderr, "[totk-audio] output started again\n"); continue; }
-        if (m->unit_ok) { m->unit_ok = 0; AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+        if (m->unit_ok && !recreate && output_start(m)) { fprintf(stderr, "[totk-audio] output started again\n"); continue; }
+        if (m->unit_ok) { m->unit_ok = 0; output_dispose(m); }
         m->ready = 0; output_open(m, m->rate);
         fprintf(stderr, "[totk-audio] output rebuilt (%s): %s\n", recreate ? "media services reset" : "start failed", m->unit_ok ? "playing" : "no sound");
     }
@@ -228,7 +280,7 @@ void audio_mixer_close(AudioRenderer *r) {
     Mixer *m = r->mixer; if (!m) return;
     pthread_mutex_lock(&g_out_mu);
     for (int i = 0; i < 4; i++) if (g_out[i] == m) g_out[i] = NULL;
-    if (m->unit_ok) { m->unit_ok = 0; AudioOutputUnitStop(m->unit); AudioUnitUninitialize(m->unit); AudioComponentInstanceDispose(m->unit); }
+    if (m->unit_ok) { m->unit_ok = 0; output_dispose(m); }
     pthread_mutex_unlock(&g_out_mu);
     if(m->capture_worker){
         pthread_mutex_lock(&m->capture_lock);m->capture_closing=1;pthread_cond_signal(&m->capture_cond);pthread_mutex_unlock(&m->capture_lock);
